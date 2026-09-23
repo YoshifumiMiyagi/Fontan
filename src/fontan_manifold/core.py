@@ -420,6 +420,60 @@ class FontanManifold:
         out[column_name] = dist
         return out
 
+    def characterize_components(
+        self,
+        clinical_df: pd.DataFrame,
+        projection_long: pd.DataFrame,
+        variables: Optional[Sequence[str]] = None,
+        dms: Sequence[str] = ("DM1", "DM2", "DM3"),
+        method: str = "spearman",
+        fdr: bool = True,
+    ) -> pd.DataFrame:
+        """Characterize diffusion components against continuous/ordinal clinical variables.
+
+        Correlations are computed separately within each imputation and summarized
+        by the median rho. P values are combined conservatively by taking the median
+        nominal P across imputations; q values are descriptive and intended for
+        component characterization, not confirmatory inference.
+        """
+        self._check_fitted()
+        if variables is None:
+            variables = [
+                v for v in self.required_vars
+                if v in clinical_df.columns
+                and self.domain_definition[
+                    next(k for k in self.active_domains if v in self.domain_definition[k]["vars"])
+                ]["type"] != "categorical"
+            ]
+        variables = [v for v in variables if v in clinical_df.columns]
+        rows = []
+        base = clinical_df[[self.id_col, *variables]].copy()
+        for mi, g in projection_long.groupby("MI"):
+            dat = g[[self.id_col, *dms]].merge(base, on=self.id_col, how="left")
+            for dm in dms:
+                for var in variables:
+                    x = pd.to_numeric(dat[dm], errors="coerce")
+                    y = pd.to_numeric(dat[var], errors="coerce")
+                    ok = x.notna() & y.notna()
+                    if ok.sum() >= 3:
+                        rho, p = spearmanr(x[ok], y[ok])
+                    else:
+                        rho, p = np.nan, np.nan
+                    rows.append({"MI": mi, "DM": dm, "Variable": var,
+                                 "N": int(ok.sum()), "rho": rho, "P_value": p})
+        long = pd.DataFrame(rows)
+        out = (long.groupby(["DM","Variable"], as_index=False)
+               .agg(N=("N","median"), rho=("rho","median"), P_value=("P_value","median")))
+        if fdr and len(out):
+            out["q_value"] = np.nan
+            valid = out["P_value"].notna()
+            if valid.any():
+                out.loc[valid,"q_value"] = multipletests(
+                    out.loc[valid,"P_value"], method="fdr_bh"
+                )[1]
+        out["abs_rho"] = out["rho"].abs()
+        return out.sort_values(["DM","abs_rho"], ascending=[True,False]).reset_index(drop=True)
+
     def domain_summary(self) -> pd.DataFrame:
         """Return the currently active domain/variable definition."""
         rows = []
