@@ -17,3 +17,10 @@ __all__ = [
     "DEFAULT_CONTINUOUS_MI_VARS",
     "DEFAULT_OUTCOMES",
 ]
+
+from .plotting import (
+    plot_manifold_3d,
+    plot_component_characterization,
+    plot_pt_scatter,
+    plot_outcome_forest,
+)
