@@ -24,3 +24,5 @@ from .plotting import (
     plot_pt_scatter,
     plot_outcome_forest,
 )
+
+from .figure1 import make_figure1
