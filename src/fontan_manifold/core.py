@@ -50,6 +50,21 @@ DEFAULT_DOMAIN_DEFINITION = {
     "Biomarker": {"type": "continuous", "vars": ["log_BNP"]},
 }
 
+DOMAIN_PRESETS = {
+    "7domain": list(DEFAULT_DOMAIN_DEFINITION.keys()),
+    "6domain_no_biomarker": [
+        "Exercise", "Remodeling", "Function", "Diastolic",
+        "Valve", "Anatomy_Surgery",
+    ],
+    "6domain_no_exercise": [
+        "Remodeling", "Function", "Diastolic",
+        "Valve", "Anatomy_Surgery", "Biomarker",
+    ],
+    "5domain_echo_core": [
+        "Remodeling", "Function", "Diastolic", "Valve", "Biomarker",
+    ],
+}
+
 DEFAULT_CONTINUOUS_MI_VARS = [
     "pp_peakvo2",
     "pp_vat",
@@ -82,6 +97,7 @@ class FontanManifold:
     def __init__(
         self,
         domain_definition: Optional[Mapping] = None,
+        domains: Sequence[str] | str = "7domain",
         n_neighbors: int = 50,
         n_dm: int = 5,
         id_col: str = "subj_id",
@@ -90,6 +106,22 @@ class FontanManifold:
         self.domain_definition = dict(
             DEFAULT_DOMAIN_DEFINITION if domain_definition is None else domain_definition
         )
+        if isinstance(domains, str):
+            if domains not in DOMAIN_PRESETS:
+                raise ValueError(
+                    f"Unknown domain preset: {domains}. "
+                    f"Available: {list(DOMAIN_PRESETS)}"
+                )
+            active = DOMAIN_PRESETS[domains]
+        else:
+            active = list(domains)
+
+        unknown = [d for d in active if d not in self.domain_definition]
+        if unknown:
+            raise ValueError(f"Unknown domains: {unknown}")
+
+        self.active_domains = list(active)
+        self.domain_preset = domains if isinstance(domains, str) else "custom"
         self.n_neighbors = int(n_neighbors)
         self.n_dm = int(n_dm)
         self.id_col = id_col
@@ -128,8 +160,8 @@ class FontanManifold:
     @property
     def required_vars(self) -> List[str]:
         cols = []
-        for spec in self.domain_definition.values():
-            cols.extend(spec["vars"])
+        for name in self.active_domains:
+            cols.extend(self.domain_definition[name]["vars"])
         return list(dict.fromkeys(cols))
 
     def make_complete_case_reference(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -253,13 +285,14 @@ class FontanManifold:
         self.domain_params_ = {}
         self.domain_distances_ = {}
 
-        for name, spec in self.domain_definition.items():
+        for name in self.active_domains:
+            spec = self.domain_definition[name]
             D, params = self._fit_domain(self.reference_df_, spec)
             self.domain_distances_[name] = D
             self.domain_params_[name] = params
 
         self.D_ref_ = np.mean(
-            np.stack([self.domain_distances_[name] for name in self.domain_definition], axis=0),
+            np.stack([self.domain_distances_[name] for name in self.active_domains], axis=0),
             axis=0,
         )
 
@@ -276,6 +309,128 @@ class FontanManifold:
         for j in range(1, n_dm + 1):
             out[f"DM{j}"] = self.psi_ref_[:, j]
         return out
+
+    def set_root(
+        self,
+        method: str = "dm1_min",
+        subject_id=None,
+        score_directions: Optional[Mapping[str, float]] = None,
+        dms: Sequence[str] = ("DM1", "DM2", "DM3"),
+    ):
+        """
+        Select and store a reference root.
+
+        method:
+          - "dm1_min" / "dm1_max" (also DM2/DM3...)
+          - "subject_id": use an explicitly specified reference subject
+          - "score": choose the minimum standardized burden score
+
+        For score_directions, +1 means higher values increase burden and
+        -1 means higher values are favorable. Example:
+            {"log_BNP": +1, "echoedv": +1, "echoef": -1,
+             "pp_peakvo2": -1, "pp_vat": -1}
+        """
+        self._check_fitted()
+        coords = self.reference_coordinates(n_dm=max(int(x[2:]) for x in dms))
+
+        if method == "subject_id":
+            if subject_id is None:
+                raise ValueError("subject_id must be supplied.")
+            hit = np.flatnonzero(
+                self.reference_df_[self.id_col].to_numpy() == subject_id
+            )
+            if len(hit) != 1:
+                raise ValueError("subject_id must identify exactly one reference subject.")
+            idx = int(hit[0])
+
+        elif method == "score":
+            if not score_directions:
+                raise ValueError("score_directions is required for method='score'.")
+            score = np.zeros(len(self.reference_df_), dtype=float)
+            for var, direction in score_directions.items():
+                if var not in self.reference_df_.columns:
+                    raise KeyError(f"Root-score variable not found: {var}")
+                x = pd.to_numeric(self.reference_df_[var], errors="coerce")
+                sd = x.std(ddof=0)
+                if not np.isfinite(sd) or sd == 0:
+                    raise ValueError(f"Cannot standardize root-score variable: {var}")
+                z = (x - x.mean()) / sd
+                score += float(direction) * z.to_numpy()
+            idx = int(np.nanargmin(score))
+            self.root_score_ = score
+
+        elif method.startswith("dm") and method.endswith(("_min", "_max")):
+            dm, tail = method.rsplit("_", 1)
+            dm = dm.upper()
+            if dm not in coords.columns:
+                raise ValueError(f"{dm} is not available.")
+            values = coords[dm].to_numpy()
+            idx = int(np.nanargmin(values) if tail == "min" else np.nanargmax(values))
+
+        else:
+            raise ValueError(
+                "method must be 'subject_id', 'score', or e.g. 'dm1_min'/'dm2_max'."
+            )
+
+        self.root_index_ = idx
+        self.root_subject_id_ = self.reference_df_.iloc[idx][self.id_col]
+        self.root_method_ = method
+        self.root_dms_ = tuple(dms)
+        self.root_coordinate_ = coords.loc[idx, list(dms)].to_numpy(dtype=float)
+        return {
+            "root_index": self.root_index_,
+            "root_subject_id": self.root_subject_id_,
+            "method": self.root_method_,
+        }
+
+    def compute_pseudotime(
+        self,
+        coordinates: Optional[pd.DataFrame] = None,
+        dms: Sequence[str] = ("DM1", "DM2", "DM3"),
+        normalize: bool = True,
+        column_name: str = "pseudo_time",
+    ) -> pd.DataFrame:
+        """
+        Compute root-relative distance in the selected diffusion-coordinate space.
+
+        This is intentionally explicit: pseudo-time is Euclidean distance from
+        the chosen root in DM space. Root selection and pseudo-time definition
+        are therefore separable and reproducible.
+        """
+        self._check_fitted()
+        if not hasattr(self, "root_index_"):
+            raise RuntimeError("Call set_root() before compute_pseudotime().")
+
+        max_dm = max(int(x[2:]) for x in dms)
+        if coordinates is None:
+            coordinates = self.reference_coordinates(n_dm=max_dm)
+        out = coordinates.copy()
+
+        ref_coords = self.reference_coordinates(n_dm=max_dm)
+        root_row = ref_coords.iloc[self.root_index_]
+        root = root_row[list(dms)].to_numpy(dtype=float)
+
+        X = out[list(dms)].to_numpy(dtype=float)
+        dist = np.sqrt(((X - root[None, :]) ** 2).sum(axis=1))
+
+        if normalize:
+            lo, hi = np.nanmin(dist), np.nanmax(dist)
+            dist = (dist - lo) / (hi - lo) if hi > lo else np.zeros_like(dist)
+
+        out[column_name] = dist
+        return out
+
+    def domain_summary(self) -> pd.DataFrame:
+        """Return the currently active domain/variable definition."""
+        rows = []
+        for name in self.active_domains:
+            spec = self.domain_definition[name]
+            rows.append({
+                "Domain": name,
+                "Type": spec["type"],
+                "Variables": ", ".join(spec["vars"]),
+            })
+        return pd.DataFrame(rows)
 
     def _cross_domain_distance(self, df_new: pd.DataFrame, domain_name: str):
         p = self.domain_params_[domain_name]
@@ -309,7 +464,7 @@ class FontanManifold:
 
         distances = [
             self._cross_domain_distance(df_new, name)
-            for name in self.domain_definition
+            for name in self.active_domains
         ]
         return np.mean(np.stack(distances, axis=0), axis=0)
 
@@ -395,6 +550,10 @@ class FontanManifold:
         continuous_vars = list(
             DEFAULT_CONTINUOUS_MI_VARS if continuous_vars is None else continuous_vars
         )
+        continuous_vars = [
+            v for v in continuous_vars
+            if v in self.required_vars and v in data.columns
+        ]
         if seeds is None:
             seeds = list(range(1001, 1001 + n_imputations))
 
