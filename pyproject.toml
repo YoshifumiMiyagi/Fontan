@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fontan-manifold"
+version = "0.1.0"
+description = "Seven-domain Fontan diffusion manifold with fixed-reference Nystrom projection and MI outcome analysis"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "statsmodels",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
